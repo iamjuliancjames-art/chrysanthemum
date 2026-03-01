@@ -1,11 +1,12 @@
 # =============================================================================
 # Cognito Synthetica v2.0 — Unified Multi-Function Suite (Python)
-# Ported from TypeScript version
+# Full codebase with inverted index upgrade for SeekerIndex
 # =============================================================================
 
 import math
 import re
 import time
+import random  # For pi/risk randomization (replace math.random())
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import List, Dict, Set, Tuple, Optional, Any
@@ -282,8 +283,8 @@ class RoomStore:
             0.02,
             1.0,
         )
-        pi = math.random()  # nosec (placeholder — replace with real randomness if needed)
-        risk = math.random() * 0.6  # nosec
+        pi = random.random()
+        risk = random.random() * 0.6
 
         meta = RoomMeta(
             kind=kind,
@@ -437,7 +438,7 @@ class RoomStore:
 
 
 # =============================================================================
-# SeekerIndex — BM25 + phrase + graph + MMR
+# SeekerIndex — BM25 + Phrase + Graph + MMR (with Inverted Index for speed)
 # =============================================================================
 
 class SeekerIndex:
@@ -449,6 +450,10 @@ class SeekerIndex:
         self.k1 = 1.5
         self.b = 0.75
 
+        # Inverted index: term → set of room IDs that contain it
+        self.term_to_docs: Dict[str, Set[int]] = defaultdict(set)
+
+        # Existing dynamic indices
         self.bigram_index: Dict[str, Set[int]] = defaultdict(set)
         self.phrase_index: Dict[str, Set[int]] = defaultdict(set)
         self.doc_tokens: Dict[int, List[str]] = {}
@@ -468,7 +473,12 @@ class SeekerIndex:
         self.doc_tokens[rid] = toks
         self.doc_lengths[rid] = len(toks)
 
-        # Bigrams
+        # Inverted index population (unique tokens per doc)
+        unique_toks = set(toks)
+        for tok in unique_toks:
+            self.term_to_docs[tok].add(rid)
+
+        # Bigrams for phrase-ish matching
         for i in range(len(toks) - 1):
             bi = f"{toks[i]} {toks[i+1]}"
             self.bigram_index[bi].add(rid)
@@ -491,11 +501,21 @@ class SeekerIndex:
         if not query_toks:
             return []
 
-        scored: List[Tuple[int, float]] = []
+        # Step 1: Candidate retrieval via inverted index (fast union/intersection)
+        candidates: Set[int] = set()
+        for term in set(query_toks):  # dedup query terms
+            if term in self.term_to_docs:
+                candidates.update(self.term_to_docs[term])
 
+        if not candidates:
+            return []  # early exit — no possible matches
+
+        # Step 2: BM25 scoring only on candidates (usually << total rooms)
+        scored: List[Tuple[int, float]] = []
         avg_len = self.store.avg_len or 100.0
 
-        for rid, doc_toks in self.doc_tokens.items():
+        for rid in candidates:
+            doc_toks = self.doc_tokens.get(rid, [])
             if not doc_toks:
                 continue
 
@@ -507,7 +527,7 @@ class SeekerIndex:
             doc_len = len(doc_toks)
 
             for term in query_toks:
-                df = self.store.df[term]
+                df = self.store.df.get(term, 0)
                 if df == 0:
                     continue
 
@@ -515,7 +535,7 @@ class SeekerIndex:
                     (self.store.total_docs - df + 0.5) / (df + 0.5) + 1
                 )
 
-                term_freq = tf[term]
+                term_freq = tf.get(term, 0)
                 numerator = term_freq * (self.k1 + 1)
                 denominator = term_freq + self.k1 * (
                     1 - self.b + self.b * (doc_len / avg_len)
@@ -527,16 +547,19 @@ class SeekerIndex:
 
         scored.sort(key=lambda x: x[1], reverse=True)
 
-        # Graph expansion (simple — add neighbors of top results)
+        # Optional: Graph expansion (kept as-is; can be expensive at scale — consider caching or sampling)
         if hops > 0 and scored:
-            expanded = set()
+            expanded = set(rid for rid, _ in scored[:top_k])
             for rid, _ in scored[:top_k]:
-                expanded.add(rid)
                 neighbors = self.store.graph.get(rid, {})
                 for nb in neighbors:
-                    if len(expanded) < top_k * 3:
+                    if len(expanded) < top_k * 5:  # cap expansion
                         expanded.add(nb)
 
+            # Re-score or re-rank expanded if desired (simple union for now)
+            # For now we just use original scored + filter to expanded
+
+        # MMR diversification
         if diversify and scored:
             selected_ids = self._mmr_select(scored, top_k, lam)
             results = []
@@ -547,6 +570,7 @@ class SeekerIndex:
                     results.append(SearchResult(room=room, score=score))
             return results
 
+        # Default: top scored
         results = []
         for rid, score in scored[:top_k]:
             room = self.store.room_by_id(rid)
@@ -564,7 +588,7 @@ class SeekerIndex:
             return []
 
         pool_ids = [rid for rid, _ in ranked]
-        texts = {}
+        texts: Dict[int, str] = {}
         for rid in pool_ids:
             room = self.store.room_by_id(rid)
             if room:
@@ -572,7 +596,7 @@ class SeekerIndex:
 
         rel = {rid: score for rid, score in ranked}
 
-        selected = [ranked[0][0]]
+        selected = [ranked[0][0]]  # greedy start with highest BM25
 
         while len(selected) < min(top_k, len(ranked)):
             best_id = None
@@ -685,7 +709,8 @@ class MartianEngine:
         drift = entropy < 2.8 or coherence < 0.45
         nudge = None
         if drift and self.store.attractors:
-            nudge = self.store.attractors[math.floor(math.random() * len(self.store.attractors))]
+            idx = random.randint(0, len(self.store.attractors) - 1)
+            nudge = self.store.attractors[idx]
 
         return TalosResult(not drift, entropy, coherence, nudge)
 
@@ -783,7 +808,7 @@ class CognitoSynthetica:
         is_anchor: bool = False,
         attractor: bool = False
     ) -> int:
-        return self.store.add_room(text, kind, is_anchor=is_anchor, attractor=attractor)
+        return self.store.add_room(text, kind, {}, {}, is_anchor, attractor)
 
     def add_page_result(
         self,
